@@ -1,119 +1,134 @@
 package com.miletoalmeida.leafletapi.service;
 
-import com.miletoalmeida.leafletapi.exception.ScrapingException;
 import com.miletoalmeida.leafletapi.dto.MedicineDTO;
-import com.miletoalmeida.leafletapi.repository.MedicineRepository;
+import com.miletoalmeida.leafletapi.dto.LeafletDTO;
+import com.miletoalmeida.leafletapi.exception.ResourceNotFoundException;
+import com.miletoalmeida.leafletapi.exception.ScrapingException;
 import com.miletoalmeida.leafletapi.service.scraping.AnvisaScrapingService;
-import jakarta.persistence.Cacheable;
-import org.springframework.beans.factory.annotation.Autowired;
+import io.micrometer.core.annotation.Timed;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
-import java.time.LocalDateTime;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
+@Slf4j
 @Service
+@RequiredArgsConstructor
 public class MedicineService {
 
-    private final MedicineRepository medicineRepository;
-    private final AnvisaScrapingService scrapingService;
-    private final CacheService cacheService;
+    private static final String CACHE_MEDICINES = "medicines";
+    private static final String CACHE_MEDICINE_DETAILS = "medicine_details";
+    
+    private final AnvisaScrapingService anvisaScrapingService;
 
-    // Cache TTL in minutes
-    private static final long CACHE_TTL = 60 * 24; // 24 hours
-
-    @Autowired
-    public MedicineService(MedicineRepository medicineRepository,
-                           AnvisaScrapingService scrapingService,
-                           CacheService cacheService) {
-        this.medicineRepository = medicineRepository;
-        this.scrapingService = scrapingService;
-        this.cacheService = cacheService;
-    }
-
-    @Cacheable(value = "searches", key = "#query")
-    public List<MedicineDTO> searchMedicines(String query) throws ScrapingException {
-        // Check DB cache first
-        String cacheKey = "search_" + query.toLowerCase();
-        Optional<List> cachedResult = cacheService.getFromCache(cacheKey, "SEARCH", List.class);
-
-        if (cachedResult.isPresent()) {
-            return cachedResult.get();
-        }
-
-        // If not cached, fetch from Anvisa
-        List<MedicineDTO> results = scrapingService.searchMedicines(query);
-
-        // Save results to cache
-        if (!results.isEmpty()) {
-            cacheService.saveToCache(cacheKey, "SEARCH", results, CACHE_TTL);
-
-            // Also save individual medicines to database
-            results.forEach(this::saveMedicineToDb);
-        }
-
-        return results;
-    }
-
-    @Cacheable(value = "medicines", key = "#registryNumber")
-    public Optional<MedicineDTO> getMedicineByRegistryNumber(String registryNumber) throws ScrapingException {
-        // Check DB first
-        Optional<MedicineDTO> medicineFromDb = medicineRepository.findByRegistryNumber(registryNumber);
-
-        if (medicineFromDb.isPresent()) {
-            MedicineDTO medicine = medicineFromDb.get();
-
-            // Check if cache is still valid
-            if (medicine.getCacheExpiry().isAfter(LocalDateTime.now())) {
-                return Optional.of(convertToDTO(medicine));
+    /**
+     * Busca medicamentos pelo nome ou princípio ativo.
+     *
+     * @param query Termo de busca (nome do medicamento ou princípio ativo)
+     * @return Lista de medicamentos encontrados
+     * @throws IllegalArgumentException se a query estiver vazia
+     * @throws ScrapingException se houver erro na consulta à Anvisa
+     */
+    @Timed(value = "medicine.search", description = "Tempo para buscar medicamentos")
+    @Cacheable(value = CACHE_MEDICINES, key = "#query.toLowerCase()", unless = "#result.isEmpty()")
+    public List<MedicineDTO> searchMedicines(String query) {
+        validateSearchQuery(query);
+        
+        try {
+            log.info("Buscando medicamentos com o termo: {}", query);
+            List<MedicineDTO> medicines = anvisaScrapingService.searchMedicines(query);
+            
+            if (medicines.isEmpty()) {
+                log.info("Nenhum medicamento encontrado para a busca: {}", query);
+                return Collections.emptyList();
             }
+            
+            log.info("Encontrados {} medicamentos para a busca: {}", medicines.size(), query);
+            return medicines;
+        } catch (ScrapingException e) {
+            log.error("Erro ao buscar medicamentos: {}", e.getMessage(), e);
+            throw e;
         }
-
-        // If not in DB or expired, search from Anvisa
-        List<MedicineDTO> searchResults = scrapingService.searchMedicines(registryNumber);
-
-        // Filter for exact registry number match
-        Optional<MedicineDTO> medicineDTO = searchResults.stream()
-                .filter(med -> registryNumber.equals(med.getRegistryNumber()))
-                .findFirst();
-
-        // Save to DB if found
-        medicineDTO.ifPresent(this::saveMedicineToDb);
-
-        return medicineDTO;
     }
 
-    private void saveMedicineToDb(MedicineDTO medicineDTO) {
-        MedicineDTO medicine = medicineRepository.findByRegistryNumber(medicineDTO.getRegistryNumber())
-                .orElse(new MedicineDTO());
-
-        // Update fields
-        medicine.setRegistryNumber(medicineDTO.getRegistryNumber());
-        medicine.setProductName(medicineDTO.getProductName());
-        medicine.setCompany(medicineDTO.getCompany());
-        medicine.setActiveIngredient(medicineDTO.getActiveIngredient());
-        medicine.setTherapeuticClass(medicineDTO.getTherapeuticClass());
-        medicine.setRegulatoryType(medicineDTO.getRegulatoryType());
-        medicine.setPresentation(medicineDTO.getPresentation());
-        medicine.setLeafletUrl(medicineDTO.getLeafletUrl());
-
-        // Update cache metadata
-        medicine.setLastUpdated(LocalDateTime.now());
-        medicine.setCacheExpiry(LocalDateTime.now().plusMinutes(CACHE_TTL));
-
-        medicineRepository.save(medicine);
+    /**
+     * Busca um medicamento específico pelo número de registro.
+     *
+     * @param registryNumber Número de registro do medicamento na Anvisa
+     * @return Medicamento encontrado
+     * @throws IllegalArgumentException se o número de registro estiver vazio
+     * @throws ResourceNotFoundException se o medicamento não for encontrado
+     * @throws ScrapingException se houver erro na consulta à Anvisa
+     */
+    @Timed(value = "medicine.get_details", description = "Tempo para obter detalhes do medicamento")
+    @Cacheable(value = CACHE_MEDICINE_DETAILS, key = "#registryNumber")
+    public Optional<MedicineDTO> getMedicineByRegistryNumber(String registryNumber) {
+        validateRegistryNumber(registryNumber);
+        
+        try {
+            log.info("Buscando medicamento com registro: {}", registryNumber);
+            List<MedicineDTO> medicines = anvisaScrapingService.searchMedicines(registryNumber);
+            
+            Optional<MedicineDTO> medicine = medicines.stream()
+                    .filter(m -> registryNumber.equals(m.getRegistryNumber()))
+                    .findFirst();
+            
+            if (medicine.isEmpty()) {
+                log.info("Medicamento não encontrado com registro: {}", registryNumber);
+            } else {
+                log.info("Medicamento encontrado com registro: {}", registryNumber);
+            }
+            
+            return medicine;
+        } catch (ScrapingException e) {
+            log.error("Erro ao buscar medicamento por registro: {}", e.getMessage(), e);
+            throw e;
+        }
     }
 
-    private MedicineDTO convertToDTO(MedicineDTO medicine) {
-        MedicineDTO dto = new MedicineDTO();
-        dto.setRegistryNumber(medicine.getRegistryNumber());
-        dto.setProductName(medicine.getProductName());
-        dto.setCompany(medicine.getCompany());
-        dto.setActiveIngredient(medicine.getActiveIngredient());
-        dto.setTherapeuticClass(medicine.getTherapeuticClass());
-        dto.setRegulatoryType(medicine.getRegulatoryType());
-        dto.setPresentation(medicine.getPresentation());
-        dto.setLeafletUrl(medicine.getLeafletUrl());
-        return dto;
+    /**
+     * Obtém a bula de um medicamento pelo número de registro.
+     *
+     * @param registryNumber Número de registro do medicamento na Anvisa
+     * @return Bula do medicamento
+     * @throws IllegalArgumentException se o número de registro estiver vazio
+     * @throws ResourceNotFoundException se a bula não for encontrada
+     * @throws ScrapingException se houver erro na consulta à Anvisa
+     */
+    @Timed(value = "medicine.get_leaflet", description = "Tempo para obter bula do medicamento")
+    @Cacheable(value = "leaflets", key = "#registryNumber")
+    public LeafletDTO getLeaflet(String registryNumber) {
+        validateRegistryNumber(registryNumber);
+        
+        try {
+            log.info("Buscando bula do medicamento com registro: {}", registryNumber);
+            return anvisaScrapingService.getLeaflet(registryNumber);
+        } catch (ScrapingException e) {
+            log.error("Erro ao buscar bula do medicamento: {}", e.getMessage(), e);
+            throw e;
+        }
+    }
+
+    private void validateSearchQuery(String query) {
+        if (!StringUtils.hasText(query)) {
+            throw new IllegalArgumentException("O termo de busca não pode estar vazio");
+        }
+        if (query.length() < 3) {
+            throw new IllegalArgumentException("O termo de busca deve ter pelo menos 3 caracteres");
+        }
+    }
+
+    private void validateRegistryNumber(String registryNumber) {
+        if (!StringUtils.hasText(registryNumber)) {
+            throw new IllegalArgumentException("O número de registro não pode estar vazio");
+        }
+        if (!registryNumber.matches("\\d+")) {
+            throw new IllegalArgumentException("O número de registro deve conter apenas números");
+        }
     }
 }
