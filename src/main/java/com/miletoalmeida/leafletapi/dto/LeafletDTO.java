@@ -1,4 +1,4 @@
-package com.miletoalmeida.leafletapi.model.DTO;
+package com.miletoalmeida.leafletapi.dto;
 
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
@@ -11,7 +11,7 @@ import java.time.LocalDateTime;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class Leaflet {
+public class LeafletDTO {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
