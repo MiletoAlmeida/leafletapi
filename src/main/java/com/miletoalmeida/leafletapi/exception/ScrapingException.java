@@ -1,11 +1,21 @@
 package com.miletoalmeida.leafletapi.exception;
 
-public class ScrapingException extends Exception {
-    public ScrapingException(String message) {
-        super(message);
-    }
+import lombok.Getter;
 
-    public ScrapingException(String message, Throwable cause) {
+@Getter
+public class ScrapingException extends RuntimeException {
+    private final ScrapingErrorType errorType;
+    
+    public ScrapingException(String message, Throwable cause, ScrapingErrorType errorType) {
         super(message, cause);
+        this.errorType = errorType;
+    }
+    
+    public enum ScrapingErrorType {
+        RATE_LIMIT_EXCEEDED,
+        PARSING_ERROR,
+        NETWORK_ERROR,
+        SERVICE_UNAVAILABLE,
+        INVALID_RESPONSE
     }
 }
