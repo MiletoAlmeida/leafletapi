@@ -1,4 +1,4 @@
-package com.miletoalmeida.leafletapi.DTO;
+package com.miletoalmeida.leafletapi.model.DTO;
 
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
