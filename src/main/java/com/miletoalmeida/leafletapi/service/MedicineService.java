@@ -1,223 +1,119 @@
 package com.miletoalmeida.leafletapi.service;
 
-import com.miletoalmeida.leafletapi.model.MedicineDetail;
-import com.miletoalmeida.leafletapi.model.MedicineSummary;
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
-import org.jsoup.select.Elements;
+import com.miletoalmeida.leafletapi.exception.ScrapingException;
+import com.miletoalmeida.leafletapi.dto.MedicineDTO;
+import com.miletoalmeida.leafletapi.repository.MedicineRepository;
+import com.miletoalmeida.leafletapi.service.scraping.AnvisaScrapingService;
+import jakarta.persistence.Cacheable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.client.WebClient;
 
-import java.time.LocalDate;
-import java.util.ArrayList;
-import java.util.Arrays;
+import java.time.LocalDateTime;
 import java.util.List;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Optional;
 
 @Service
 public class MedicineService {
 
-    private final WebClient webClient;
-    private static final String ANVISA_BASE_URL = "https://consultas.anvisa.gov.br/";
-    private static final String SEARCH_URL = ANVISA_BASE_URL + "api/consulta/medicamentos?count=10&filter%5BnomeProduto%5D=";
-    private static final String MANUFACTURER_URL = ANVISA_BASE_URL + "api/consulta/medicamentos?count=10&filter%5BrazaoSocial%5D=";
-    private static final String DETAIL_URL = ANVISA_BASE_URL + "consulta/medicamentos/25351";
-    private static final String LEAFLET_BASE_URL = "https://consultas.anvisa.gov.br/bulario/";
+    private final MedicineRepository medicineRepository;
+    private final AnvisaScrapingService scrapingService;
+    private final CacheService cacheService;
+
+    // Cache TTL in minutes
+    private static final long CACHE_TTL = 60 * 24; // 24 hours
 
     @Autowired
-    public MedicineService(WebClient webClient) {
-        this.webClient = webClient;
+    public MedicineService(MedicineRepository medicineRepository,
+                           AnvisaScrapingService scrapingService,
+                           CacheService cacheService) {
+        this.medicineRepository = medicineRepository;
+        this.scrapingService = scrapingService;
+        this.cacheService = cacheService;
     }
 
-    public List<MedicineSummary> findByName(String name) {
-        try {
-            String searchUrl = SEARCH_URL + name.replace(" ", "%20");
-            String response = webClient.get()
-                    .uri(searchUrl)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
+    @Cacheable(value = "searches", key = "#query")
+    public List<MedicineDTO> searchMedicines(String query) throws ScrapingException {
+        // Check DB cache first
+        String cacheKey = "search_" + query.toLowerCase();
+        Optional<List> cachedResult = cacheService.getFromCache(cacheKey, "SEARCH", List.class);
 
-            List<MedicineSummary> results = parseMedicineResponse(response);
+        if (cachedResult.isPresent()) {
+            return cachedResult.get();
+        }
 
-            // Caso não encontre resultados na ANVISA ou ocorra erro, retorna dados mockados para teste
-            if (results.isEmpty()) {
-                return generateMockData(name, 5);
+        // If not cached, fetch from Anvisa
+        List<MedicineDTO> results = scrapingService.searchMedicines(query);
+
+        // Save results to cache
+        if (!results.isEmpty()) {
+            cacheService.saveToCache(cacheKey, "SEARCH", results, CACHE_TTL);
+
+            // Also save individual medicines to database
+            results.forEach(this::saveMedicineToDb);
+        }
+
+        return results;
+    }
+
+    @Cacheable(value = "medicines", key = "#registryNumber")
+    public Optional<MedicineDTO> getMedicineByRegistryNumber(String registryNumber) throws ScrapingException {
+        // Check DB first
+        Optional<MedicineDTO> medicineFromDb = medicineRepository.findByRegistryNumber(registryNumber);
+
+        if (medicineFromDb.isPresent()) {
+            MedicineDTO medicine = medicineFromDb.get();
+
+            // Check if cache is still valid
+            if (medicine.getCacheExpiry().isAfter(LocalDateTime.now())) {
+                return Optional.of(convertToDTO(medicine));
             }
-
-            return results;
-        } catch (Exception e) {
-            System.err.println("Error searching medicine by name: " + e.getMessage());
-            // Retorna dados mockados para facilitar o desenvolvimento
-            return generateMockData(name, 5);
-        }
-    }
-
-    public List<MedicineSummary> findByManufacturer(String manufacturer) {
-        try {
-            String searchUrl = MANUFACTURER_URL + manufacturer.replace(" ", "%20");
-            String response = webClient.get()
-                    .uri(searchUrl)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
-
-            List<MedicineSummary> results = parseMedicineResponse(response);
-
-            // Caso não encontre resultados na ANVISA ou ocorra erro, retorna dados mockados para teste
-            if (results.isEmpty()) {
-                return generateMockData(manufacturer, 5);
-            }
-
-            return results;
-        } catch (Exception e) {
-            System.err.println("Error searching medicine by manufacturer: " + e.getMessage());
-            // Retorna dados mockados para facilitar o desenvolvimento
-            return generateMockData(manufacturer, 5);
-        }
-    }
-
-    public MedicineDetail findDetailById(String id) {
-        try {
-            // Na ANVISA, geralmente precisamos do número de processo completo
-            String detailUrl = DETAIL_URL + id;
-
-            // Aqui faríamos uma requisição para a página de detalhes
-            // e extrairíamos as informações usando JSoup
-
-            // Para fins de demonstração, retornamos um objeto mockado
-            return generateMockDetail(id);
-        } catch (Exception e) {
-            System.err.println("Error retrieving medicine details: " + e.getMessage());
-            return generateMockDetail(id);
-        }
-    }
-
-    public String getLeafletUrl(String id) {
-        try {
-            // Tentaria buscar a URL real da bula na ANVISA
-            // Para demonstração, retornamos uma URL fictícia
-            return LEAFLET_BASE_URL + "pdf/" + id + ".pdf";
-        } catch (Exception e) {
-            System.err.println("Error retrieving leaflet URL: " + e.getMessage());
-            return null;
-        }
-    }
-
-    private List<MedicineSummary> parseMedicineResponse(String htmlResponse) {
-        List<MedicineSummary> medicines = new ArrayList<>();
-
-        try {
-            Document doc = Jsoup.parse(htmlResponse);
-            Elements medicineElements = doc.select("div.result-item");
-
-            for (Element medicineElement : medicineElements) {
-                MedicineSummary medicine = new MedicineSummary();
-
-                // Gerando um ID único para uso interno na API
-                medicine.setId(UUID.randomUUID().toString());
-
-                Element nameElement = medicineElement.selectFirst("h3.product-name");
-                if (nameElement != null) {
-                    medicine.setName(nameElement.text());
-                }
-
-                Element manufacturerElement = medicineElement.selectFirst("p.company-name");
-                if (manufacturerElement != null) {
-                    medicine.setManufacturer(manufacturerElement.text());
-                }
-
-                Element categoryElement = medicineElement.selectFirst("span.category");
-                if (categoryElement != null) {
-                    medicine.setRegulatoryCategory(categoryElement.text());
-                }
-
-                Element registrationElement = medicineElement.selectFirst("span.registration");
-                if (registrationElement != null) {
-                    medicine.setRegistrationNumber(registrationElement.text());
-                }
-
-                Element ingredientElement = medicineElement.selectFirst("div.active-ingredient");
-                if (ingredientElement != null) {
-                    medicine.setActiveIngredient(ingredientElement.text());
-                }
-
-                Element pdfElement = medicineElement.selectFirst("a.pdf-link");
-                if (pdfElement != null) {
-                    medicine.setPdfUrl(pdfElement.attr("href"));
-                }
-
-                medicines.add(medicine);
-            }
-        } catch (Exception e) {
-            System.err.println("Error parsing HTML response: " + e.getMessage());
         }
 
-        return medicines;
+        // If not in DB or expired, search from Anvisa
+        List<MedicineDTO> searchResults = scrapingService.searchMedicines(registryNumber);
+
+        // Filter for exact registry number match
+        Optional<MedicineDTO> medicineDTO = searchResults.stream()
+                .filter(med -> registryNumber.equals(med.getRegistryNumber()))
+                .findFirst();
+
+        // Save to DB if found
+        medicineDTO.ifPresent(this::saveMedicineToDb);
+
+        return medicineDTO;
     }
 
-    // Método auxiliar para gerar dados mockados para testes
-    private List<MedicineSummary> generateMockData(String query, int count) {
-        List<MedicineSummary> mockMedicines = new ArrayList<>();
-        AtomicInteger idCounter = new AtomicInteger(1);
+    private void saveMedicineToDb(MedicineDTO medicineDTO) {
+        MedicineDTO medicine = medicineRepository.findByRegistryNumber(medicineDTO.getRegistryNumber())
+                .orElse(new MedicineDTO());
 
-        String[] classes = {"Anti-inflamatório", "Analgésico", "Antibiótico", "Antialérgico", "Antidepressivo"};
-        String[] ingredients = {"Paracetamol", "Ibuprofeno", "Amoxicilina", "Loratadina", "Fluoxetina"};
+        // Update fields
+        medicine.setRegistryNumber(medicineDTO.getRegistryNumber());
+        medicine.setProductName(medicineDTO.getProductName());
+        medicine.setCompany(medicineDTO.getCompany());
+        medicine.setActiveIngredient(medicineDTO.getActiveIngredient());
+        medicine.setTherapeuticClass(medicineDTO.getTherapeuticClass());
+        medicine.setRegulatoryType(medicineDTO.getRegulatoryType());
+        medicine.setPresentation(medicineDTO.getPresentation());
+        medicine.setLeafletUrl(medicineDTO.getLeafletUrl());
 
-        for (int i = 0; i < count; i++) {
-            MedicineSummary medicine = new MedicineSummary();
-            String id = String.valueOf(idCounter.getAndIncrement());
-            medicine.setId(id);
-            medicine.setName(query.toUpperCase() + " " + id);
-            medicine.setManufacturer("Laboratório " + (i % 3 + 1));
-            medicine.setRegulatoryCategory("Medicamento " + (i % 2 == 0 ? "Similar" : "Genérico"));
-            medicine.setRegistrationNumber("1.0000.0000." + id);
-            medicine.setActiveIngredient(ingredients[i % ingredients.length]);
-            medicine.setTherapeuticClass(classes[i % classes.length]);
-            medicine.setPdfUrl(LEAFLET_BASE_URL + "pdf/mock" + id + ".pdf");
-            medicine.setPresentation("Caixa com " + (i + 1) * 10 + " comprimidos");
-            mockMedicines.add(medicine);
-        }
+        // Update cache metadata
+        medicine.setLastUpdated(LocalDateTime.now());
+        medicine.setCacheExpiry(LocalDateTime.now().plusMinutes(CACHE_TTL));
 
-        return mockMedicines;
+        medicineRepository.save(medicine);
     }
 
-    private MedicineDetail generateMockDetail(String id) {
-        MedicineDetail detail = new MedicineDetail();
-        detail.setId(id);
-        detail.setName("MEDICAMENTO DETALHADO " + id);
-        detail.setManufacturer("Laboratório Brasileiro S.A.");
-        detail.setRegulatoryCategory("Medicamento Similar");
-        detail.setRegistrationNumber("1.0000.0000." + id);
-        detail.setActiveIngredient("Paracetamol 500mg");
-        detail.setTherapeuticClass("Analgésico e Antitérmico");
-        detail.setPdfUrl(LEAFLET_BASE_URL + "pdf/mock" + id + ".pdf");
-        detail.setPresentation("Caixa com 20 comprimidos revestidos");
-
-        // Campos específicos do detalhe
-        detail.setRegistrationDate(LocalDate.now().minusYears(2));
-        detail.setExpirationDate(LocalDate.now().plusYears(3));
-        detail.setProcessNumber("25351.123456/" + id + "-12");
-        detail.setAdministrationForm("Oral");
-        detail.setRegisterStatus("Ativo");
-        detail.setPackageType("Blister de alumínio");
-        detail.setContraindications(Arrays.asList(
-                "Hipersensibilidade aos componentes da fórmula",
-                "Pacientes com doença hepática grave",
-                "Uso concomitante com outros medicamentos contendo paracetamol"
-        ));
-        detail.setSideEffects(Arrays.asList(
-                "Reações alérgicas",
-                "Náusea e vômito",
-                "Dor abdominal",
-                "Elevação de enzimas hepáticas"
-        ));
-        detail.setDosage("Adultos: 1 comprimido a cada 6 horas. Não exceder 4 comprimidos em 24 horas.");
-        detail.setStorage("Conservar em temperatura ambiente (15 a 30ºC). Proteger da luz e umidade.");
-
-        return detail;
+    private MedicineDTO convertToDTO(MedicineDTO medicine) {
+        MedicineDTO dto = new MedicineDTO();
+        dto.setRegistryNumber(medicine.getRegistryNumber());
+        dto.setProductName(medicine.getProductName());
+        dto.setCompany(medicine.getCompany());
+        dto.setActiveIngredient(medicine.getActiveIngredient());
+        dto.setTherapeuticClass(medicine.getTherapeuticClass());
+        dto.setRegulatoryType(medicine.getRegulatoryType());
+        dto.setPresentation(medicine.getPresentation());
+        dto.setLeafletUrl(medicine.getLeafletUrl());
+        return dto;
     }
 }
